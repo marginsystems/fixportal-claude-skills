@@ -137,8 +137,8 @@ if ($summaryFiles) {
         Set-Content -LiteralPath $probePath -Value '' -NoNewline -ErrorAction Stop
         $fsCaseInsensitive = Test-Path -LiteralPath (Join-Path $RunRoot $probeName.ToUpperInvariant())
     } catch {
-        Write-Error "Could not determine the filesystem's case rule under $RunRoot ($($_.Exception.Message)). Aggregation compares chunk ids against on-disk directories, and guessing the case rule could collapse c01/C01 and emit short totals. Make RunRoot writable and re-run." -ErrorAction Continue
-        exit 6
+        Write-Warning "Could not determine the filesystem's case rule under $RunRoot ($($_.Exception.Message)). Assuming case-sensitive (Ordinal) comparison; chunk ids differing only in case may appear as orphans. Make RunRoot writable and re-run for precise detection."
+        $fsCaseInsensitive = $false
     } finally {
         if (Test-Path -LiteralPath $probePath) { Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue }
     }

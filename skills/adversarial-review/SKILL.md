@@ -669,18 +669,24 @@ lands as all-zeros. Instead:
    **Repairing chunks:** re-run `batch-review.ps1` with a manifest of just the bad
    chunks and the SAME `-RunRoot`. It unions `batch-summary.json` by `chunkId`
    (this invocation winning per chunk), so the chunks that went well are kept and
-   the run keeps its true `ChunkCount`. Two hazards:
+   the run keeps its true `ChunkCount`. Hazards:
    - A retry **overwrites** its chunk dir, so a retry that goes worse downgrades
      that chunk. Back the dir up **outside** the RunRoot first — `aggregate-and-emit.ps1`
      treats every chunk dir under the RunRoot as part of the run, and refuses to
      emit if it finds one the summary does not name.
-   - That refusal is also what a pre-union RunRoot looks like (its summary was
+   - That refusal (exit 4) is also what a pre-union RunRoot looks like (its summary was
      overwritten by the last retry). Rebuild `batch-summary.json` from the chunk
      dirs. You *can* instead delete it and let `aggregate-and-emit.ps1` scan every
      chunk dir under the RunRoot — but that scan only finds chunks that left a
      `metrics.json`, so it **silently drops any FAILED chunk** (a failed chunk
      writes no metrics). Only delete the summary when every chunk is known to have
      succeeded; otherwise rebuild it so the failed chunks stay counted.
+   - `aggregate-and-emit.ps1` may also refuse with **exit 5** (a batch-summary
+     row is missing its chunkId or carries an invalid id — rebuild the summary
+     files) or **exit 7** (a row marks a chunk as failed but a metrics.json
+     exists in its dir — remove the stale metrics.json or set `hasMetrics` to
+     `true` in the row). In both cases the summary and the filesystem disagree;
+     the script refuses rather than silently inflating or undercounting totals.
 
 2. **At §5 synthesis, write `<RunRoot>/aggregate-verdict.json`** — the two things
    that are host judgment, not deterministic: `issuesAccepted` per reviewer (each

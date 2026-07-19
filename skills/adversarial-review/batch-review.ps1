@@ -86,7 +86,7 @@ $ids = @($chunks | ForEach-Object { $_.id })
 # so 'C01.' and 'C01' would resolve to the SAME directory while reading as two
 # distinct ids -- two chunks racing one dir, or a double-counted metrics.json.
 $bad = @($ids | Where-Object { $_ -notmatch '^[A-Za-z0-9._-]+$' -or $_ -match '^\.+$' -or $_ -match '[. ]$' })
-if ($bad) { Write-Error "Invalid chunk id(s) — must match [A-Za-z0-9._-], not be all dots, and not end in '.' or space: $($bad -join ', ')"; exit 2 }
+if ($bad) { Write-Error "Invalid chunk id(s) — must match [A-Za-z0-9._-], not be all dots, and not end in '.' or space: $($bad.ForEach({ "'$_'" }) -join ', ')"; exit 2 }
 $dupes = @($ids | Group-Object | Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name })
 if ($dupes) { Write-Error "Duplicate chunk id(s): $($dupes -join ', ')"; exit 2 }
 
