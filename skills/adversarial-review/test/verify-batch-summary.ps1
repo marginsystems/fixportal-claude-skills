@@ -240,7 +240,7 @@ try {
             )
         } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $d 'metrics.json') -Encoding utf8
     }
-    @('C01', 'C02', 'C03' | ForEach-Object {
+    @('C01', 'C02', 'C03') | ForEach-Object {
         [pscustomobject]@{ chunkId = $_; label = "chunk $_"; exitCode = 0; elapsedSec = 1
                            workDir = ".\run3\$_"; hasMetrics = $true }
     }) | ConvertTo-Json -Depth 5 -AsArray | Set-Content -LiteralPath (Join-Path $runRoot3 'batch-summary.json') -Encoding utf8
