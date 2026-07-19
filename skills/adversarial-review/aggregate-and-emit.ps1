@@ -178,7 +178,7 @@ if (Test-Path -LiteralPath $batchSummary) {
     # something to silently resolve in the inflating direction: refuse.
     $contradictions = @($summaryRows | Where-Object {
         -not [string]::IsNullOrWhiteSpace([string]$_.chunkId) -and
-        (($_.hasMetrics -eq $false) -or ($null -ne $_.exitCode -and [int]$_.exitCode -ne 0)) -and
+        (($null -eq $_.hasMetrics -or $_.hasMetrics -eq $false) -or ($null -ne $_.exitCode -and [int]$_.exitCode -ne 0)) -and
         (Test-Path -LiteralPath (Join-Path (Join-Path $RunRoot ([string]$_.chunkId)) 'metrics.json'))
     })
     if ($contradictions) {
