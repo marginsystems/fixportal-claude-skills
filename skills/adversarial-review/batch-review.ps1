@@ -184,70 +184,41 @@ $results = $chunks | ForEach-Object -ThrottleLimit $BatchSize -Parallel {
 $results = @($results) | Sort-Object chunkId
 
 # Repairing a run means re-running this script into the SAME RunRoot with a subset
-# manifest, so the chunks that already went well are kept. Writing the summary
-# wholesale silently shrank the run to that subset: aggregate-and-emit.ps1 reads
-# this file as the source of truth for WHICH chunks belong to the run, so a
-# 15-chunk audit repaired in three retries (11, then 5, then 4) emitted as a
-# 4-chunk run, with every per-vendor total short and every `accepted` clamped down
-# to match — a plausible, wrong run. Union by chunkId instead, this invocation
-# winning per chunk, so a RunRoot accumulates chunks across invocations.
-$summaryPath = Join-Path $RunRoot 'batch-summary.json'
-$merged = [ordered]@{}
-if (Test-Path -LiteralPath $summaryPath) {
-    try {
-        foreach ($row in @(Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json)) {
-            # A row with no chunkId can't be keyed or carried forward. Skipping it
-            # would silently drop that chunk (a failed one left no metrics dir either,
-            # so nothing downstream catches it). Treat it as a malformed summary and
-            # fall into the preserve-aside path rather than quietly losing the row.
-            if ([string]::IsNullOrWhiteSpace([string]$row.chunkId)) { throw "summary contains a row with no chunkId" }
-            $merged[$row.chunkId] = $row
-        }
-    } catch {
-        # Don't blindly proceed: the prior summary may name FAILED chunks that left no
-        # metrics.json -- those exist only as summary rows, so overwriting the file
-        # would erase them with no way to rediscover them (the fallback scan only finds
-        # metrics.json). Move the unreadable/malformed file aside first so its bytes
-        # survive for recovery, THEN write this invocation's rows. But if that move
-        # itself fails, do NOT fall through to the overwrite -- that would destroy the
-        # only record. Let the move throw and abort the run instead; the per-chunk
-        # metrics.json dirs are all still on disk, so nothing this run computed is lost.
-        $reason = $_.Exception.Message
-        $preserved = "$summaryPath.unreadable-$PID-$([guid]::NewGuid().ToString('N').Substring(0,8))"
-        Move-Item -LiteralPath $summaryPath -Destination $preserved -Force
-        Write-Warning "Existing batch-summary.json is unusable ($reason) — moved to $preserved and writing this invocation's $($results.Count) chunk(s) only. Any earlier FAILED chunks (no metrics.json) live only in the preserved file; recover their rows from it before aggregating, or aggregate-and-emit.ps1 will under-count them."
-        $merged = [ordered]@{}
-    }
-}
-$carried = @($merged.Keys | Where-Object { $_ -notin @($results.chunkId) })
-foreach ($row in @($results)) { $merged[$row.chunkId] = $row }
-$summaryRows = @($merged.Values) | Sort-Object chunkId
-# -AsArray: a single-chunk invocation would otherwise serialise as a bare object,
-# and the merge above reads this file back.
+# manifest, so the chunks that already went well are kept. Each invocation writes
+# its own per-PID batch-summary file, and aggregate-and-emit.ps1 reads all of them
+# and unions by chunkId at aggregation time. This is safe under concurrent
+# invocations: each writes a different file, so they never overwrite each other's
+# data -- the race that lost concurrent invocations' chunks.
+# Write this invocation's results to a per-invocation file. Concurrent
+# batch-review.ps1 invocations each write their own file, so they never
+# overwrite each other's data. aggregate-and-emit.ps1 reads every
+# batch-summary.*.json file and unions them by chunkId at aggregation time.
 #
-# Write to a temp file in the SAME directory, then atomically replace the real
-# path, rather than Set-Content directly on it. Set-Content truncates then writes;
-# a process killed mid-write leaves invalid JSON, and the merge's own catch block
-# above would then discard every chunk this file previously named -- the exact
-# "repair shrinks the run" failure this whole union exists to prevent, just
-# triggered by a crash instead of an overwrite. A same-directory temp path keeps
-# the replace on one volume.
-#
-# [System.IO.File]::Move($src, $dst, $true), not Move-Item -Force: the cmdlet's
-# own overwrite handling is not documented as atomic and its behaviour under a
-# blocked overwrite ("Cannot create a file when that file already exists") is not
-# the same guarantee as calling the framework's own overwrite-aware overload
-# directly. File.Move's 3-arg form is the documented atomic same-volume replace
-# (.NET Core 3.0+, so present on any PowerShell 7 runtime) and needs no separate
-# "destination doesn't exist yet" branch -- it handles both.
-$tempSummaryPath = "$summaryPath.tmp-$PID"
-$summaryRows | ConvertTo-Json -Depth 5 -AsArray | Set-Content -LiteralPath $tempSummaryPath -Encoding utf8
+# Write to a temp path first, then rename atomically: a killed process leaves
+# no corrupt file (Set-Content truncates then writes, which would leave partial
+# JSON on crash). The temp path is on the same volume, so the rename is atomic.
+$partialPath = Join-Path $RunRoot "batch-summary.$PID.json"
+$tempPartial = "$partialPath.tmp"
+$results | ConvertTo-Json -Depth 5 -AsArray | Set-Content -LiteralPath $tempPartial -Encoding utf8
 try {
-    [System.IO.File]::Move($tempSummaryPath, $summaryPath, $true)
+    [System.IO.File]::Move($tempPartial, $partialPath, $true)
 } catch {
-    Remove-Item -LiteralPath $tempSummaryPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $tempPartial -Force -ErrorAction SilentlyContinue
     throw
 }
+
+# Compute the set of all chunk ids across ALL invocations for the output message.
+$carried = @()
+$allChunkIds = [System.Collections.Generic.HashSet[string]]::new()
+foreach ($sf in @(Get-ChildItem -LiteralPath $RunRoot -Filter 'batch-summary*.json' -File)) {
+    try {
+        foreach ($row in @(Get-Content -LiteralPath $sf.FullName -Raw | ConvertFrom-Json)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$row.chunkId)) { [void]$allChunkIds.Add([string]$row.chunkId) }
+        }
+    } catch { }
+}
+$carried = @($allChunkIds | Where-Object { $_ -notin @($results.chunkId) })
+$runChunks = $allChunkIds.Count
 
 $failed  = @($results | Where-Object { $_.exitCode -ne 0 })
 $noMetrics = @($results | Where-Object { $_.exitCode -eq 0 -and -not $_.hasMetrics })
@@ -256,7 +227,7 @@ Write-Host ""
 Write-Host "==== batch complete: $RunId ===="
 $results | Format-Table chunkId, label, exitCode, elapsedSec, hasMetrics -AutoSize | Out-String | Write-Host
 if ($carried) {
-    Write-Host "Kept $($carried.Count) chunk(s) already in this RunRoot ($($carried -join ', ')) — the run now has $($summaryRows.Count) chunk(s) in total."
+    Write-Host "Kept $($carried.Count) chunk(s) already in this RunRoot ($($carried -join ', ')) — the run now has $runChunks chunk(s) in total."
 }
 if ($failed)    { Write-Warning "$($failed.Count) chunk(s) failed: $($failed.chunkId -join ', ') — they contribute no metrics." }
 if ($noMetrics) { Write-Warning "$($noMetrics.Count) chunk(s) left no metrics.json: $($noMetrics.chunkId -join ', ')." }
@@ -268,4 +239,4 @@ Write-Host "     (accepted per reviewer + judge participant)."
 Write-Host "  3. pwsh -NoProfile -File `"$scriptDir\aggregate-and-emit.ps1`" -RunRoot `"$RunRoot`" -Repo <repo> [-Summary <name>]"
 # `chunks` is what THIS invocation ran; `runChunks` is what the RunRoot now holds
 # in total, which is the number aggregate-and-emit.ps1 will emit as ChunkCount.
-[pscustomobject]@{ runRoot = $RunRoot; runId = $RunId; chunks = $results.Count; runChunks = $summaryRows.Count; failed = $failed.Count } | ConvertTo-Json -Compress
+[pscustomobject]@{ runRoot = $RunRoot; runId = $RunId; chunks = $results.Count; runChunks = $runChunks; failed = $failed.Count } | ConvertTo-Json -Compress

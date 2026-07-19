@@ -1,6 +1,7 @@
 $ErrorActionPreference = 'Stop'
 <#
-  batch-summary.json is the source of truth for WHICH chunks belong to a run.
+  The batch-summary.*.json files (one per batch-review.ps1 invocation) are the
+  source of truth for WHICH chunks belong to a run.
   These tests pin the two halves of that contract:
 
     batch-review.ps1        must let a RunRoot accumulate chunks across repeated
@@ -35,9 +36,15 @@ try {
             ConvertTo-Json -Depth 5 -AsArray | Set-Content -LiteralPath $path -Encoding utf8
     }
     function Get-SummaryIds([string] $runRoot) {
-        $p = Join-Path $runRoot 'batch-summary.json'
-        if (-not (Test-Path -LiteralPath $p)) { return @() }
-        @(Get-Content -LiteralPath $p -Raw | ConvertFrom-Json | ForEach-Object { $_.chunkId } | Sort-Object)
+        $ids = @()
+        foreach ($sf in @(Get-ChildItem -LiteralPath $runRoot -Filter 'batch-summary*.json' -File | Sort-Object Name)) {
+            try {
+                foreach ($row in @(Get-Content -LiteralPath $sf.FullName -Raw | ConvertFrom-Json)) {
+                    if (-not [string]::IsNullOrWhiteSpace([string]$row.chunkId)) { $ids += $row.chunkId }
+                }
+            } catch { }
+        }
+        return @($ids | Sort-Object -Unique)
     }
 
     # --- batch-review.ps1 unions the summary across invocations ---------------
@@ -54,18 +61,22 @@ try {
     if (($ids -join ',') -ne 'C01,C02,C03') { throw "first invocation should record all 3 chunks, got '$($ids -join ',')'" }
 
     # The repair: re-run ONLY C02 into the same RunRoot, keeping the good chunks.
-    # Wholesale-writing the summary here shrank a 15-chunk audit to its last retry
-    # of 4, and aggregate-and-emit then reported that as the whole run.
-    # The exit-code check is load-bearing, not ceremony: if this invocation died
-    # before writing, the summary would still hold the first run's C01,C02,C03 and
-    # the assertion below would pass without the merge ever running.
+    # Each invocation writes its own per-PID file, so aggregate-and-emit.ps1 reads
+    # all files and unions by chunkId -- later invocations' rows win for duplicates.
     & pwsh -NoProfile -File $batch -ChunkManifest $m2 -RepoPath $fakeRepo -RunRoot $runRoot -BatchSize 1 *>$null
     if ($LASTEXITCODE -ne 0) { throw "repair batch invocation exited $LASTEXITCODE" }
     $ids = Get-SummaryIds $runRoot
     if (($ids -join ',') -ne 'C01,C02,C03') { throw "repair re-run must keep the untouched chunks, got '$($ids -join ',')'" }
 
     # ...and the retried chunk must be the REPAIRED row, exactly once.
-    $rows = @(Get-Content -LiteralPath (Join-Path $runRoot 'batch-summary.json') -Raw | ConvertFrom-Json)
+    $rows = @()
+    $mRows = [ordered]@{}
+    foreach ($sf in @(Get-ChildItem -LiteralPath $runRoot -Filter 'batch-summary*.json' -File | Sort-Object Name)) {
+        foreach ($row in @(Get-Content -LiteralPath $sf.FullName -Raw | ConvertFrom-Json)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$row.chunkId)) { $mRows[$row.chunkId] = $row }
+        }
+    }
+    $rows = @($mRows.Values)
     $c02  = @($rows | Where-Object { $_.chunkId -eq 'C02' })
     if ($c02.Count -ne 1) { throw "the union must leave C02 exactly once, got $($c02.Count) row(s)" }
     if ($c02[0].label -ne 'repair C02') { throw "the repair invocation must win for C02, got label '$($c02[0].label)'" }
@@ -91,7 +102,13 @@ try {
     if (Test-Path -LiteralPath (Join-Path $runRoot4 'C01\metrics.json')) {
         throw "a retry that wrote no metrics.json must not leave the previous attempt's behind"
     }
-    $row4 = @(Get-Content -LiteralPath (Join-Path $runRoot4 'batch-summary.json') -Raw | ConvertFrom-Json)[0]
+    $merged4 = [ordered]@{}
+    foreach ($sf4 in @(Get-ChildItem -LiteralPath $runRoot4 -Filter 'batch-summary*.json' -File | Sort-Object Name)) {
+        foreach ($row in @(Get-Content -LiteralPath $sf4.FullName -Raw | ConvertFrom-Json)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$row.chunkId)) { $merged4[$row.chunkId] = $row }
+        }
+    }
+    $row4 = @($merged4.Values)[0]
     # exitCode first: without it the hasMetrics assertion is vacuous if the retry
     # somehow SUCCEEDED (nothing to inherit). Compare hasMetrics against $false
     # explicitly rather than testing truthiness, which also passes when the property
@@ -152,7 +169,7 @@ try {
         "batch-review.ps1 SKIPPED — rollback-on-abort fault injection needs Windows file-share semantics"
     }
 
-    # batch-summary.json's write-then-rename (batch-review.ps1, near the union) is
+    # batch-summary.*.json's write-then-rename (batch-review.ps1) is
     # deliberately NOT covered by a test here. The property it defends -- a process
     # dying between truncate and write-complete must not leave a corrupted summary
     # -- can only be faked by locking the destination, and Windows then refuses to
@@ -242,8 +259,8 @@ try {
     "aggregate-and-emit.ps1 OK — chunk ids resolve against RunRoot, so workDir path form is irrelevant"
 
     # --- a hand-rebuilt summary can't traverse out of RunRoot -----------------
-    # The repair flow tells operators to rebuild batch-summary.json by hand, so its
-    # chunkIds are untrusted. A '..<sep>escape' id would otherwise join into a path
+    # The repair flow tells operators to rebuild the batch-summary files by hand, so
+    # their chunkIds are untrusted. A '..<sep>escape' id would otherwise join into a path
     # outside RunRoot and aggregate an unrelated metrics.json, invisibly to the
     # orphan scan (the resolved dir isn't a child of RunRoot). It must be refused.
     # Build the id with the platform separator so it is a REAL parent-ref on POSIX
@@ -356,7 +373,7 @@ try {
     # -ErrorAction Continue is caught rather than silently reverting the code.
     $runRoot8 = Join-Path $root 'run8'
     New-Item -ItemType Directory -Path $runRoot8 -Force | Out-Null
-    # exit 3: a RunRoot with no batch-summary.json and no metrics.json anywhere.
+    # exit 3: a RunRoot with no batch-summary files and no metrics.json anywhere.
     $out = (& pwsh -NoProfile -File $agg -RunRoot $runRoot8 -Repo test-repo 2>&1 | Out-String)
     if ($LASTEXITCODE -ne 3) { throw "an empty RunRoot must exit 3 (no metrics to aggregate), got $LASTEXITCODE`n$out" }
 

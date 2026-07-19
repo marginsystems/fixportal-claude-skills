@@ -78,15 +78,26 @@ if (-not $RunId)       { $RunId = Split-Path -Leaf $RunRoot }
 if (-not $VerdictPath) { $VerdictPath = Join-Path $RunRoot 'aggregate-verdict.json' }
 
 # --- Collect per-chunk metrics ------------------------------------------
-# batch-summary.json (written by batch-review.ps1) is the source of truth for
-# BOTH which chunks belong to this run and how many there were. Use it to pick
-# the exact chunk dirs to aggregate — a blind recursive scan of RunRoot would
-# also pull in stale metrics.json left over from a reused run root and inflate
-# the totals while ChunkCount came from the newer summary. Fall back to the
-# recursive scan only for an ad-hoc batch that did not go through batch-review.ps1.
-$batchSummary = Join-Path $RunRoot 'batch-summary.json'
-if (Test-Path -LiteralPath $batchSummary) {
-    $summaryRows = @(Get-Content -LiteralPath $batchSummary -Raw | ConvertFrom-Json)
+# batch-summary.*.json files (written by batch-review.ps1, one per invocation) are
+# the source of truth for BOTH which chunks belong to this run and how many there
+# were. We read all of them and union by chunkId (last writer wins for duplicates).
+# A blind recursive scan of RunRoot would also pull in stale metrics.json left over
+# from a reused run root and inflate the totals while ChunkCount came from the
+# summary. Fall back to the recursive scan only for an ad-hoc batch that did not
+# go through batch-review.ps1.
+$summaryFiles = @(Get-ChildItem -LiteralPath $RunRoot -Filter 'batch-summary*.json' -File | Sort-Object Name)
+if ($summaryFiles) {
+    $mergedRows = [ordered]@{}
+    foreach ($sf in $summaryFiles) {
+        try {
+            foreach ($row in @(Get-Content -LiteralPath $sf.FullName -Raw | ConvertFrom-Json)) {
+                if (-not [string]::IsNullOrWhiteSpace([string]$row.chunkId)) {
+                    $mergedRows[$row.chunkId] = $row
+                }
+            }
+        } catch { }
+    }
+    $summaryRows = @($mergedRows.Values) | Sort-Object chunkId
 
     # A run IS its set of distinct chunk ids. Resolve each chunk's metrics.json from
     # <RunRoot>/<chunkId> rather than from the row's persisted workDir: batch-review.ps1
@@ -110,8 +121,8 @@ if (Test-Path -LiteralPath $batchSummary) {
     # of being refused.
     #
     # Probe with a FRESH uniquely-named marker, not a case-flip of an existing file:
-    # a fixed 'BATCH-SUMMARY.JSON' probe would read as case-insensitive if a distinct
-    # all-caps file happened to exist beside the lowercase summary on a case-sensitive
+    # a fixed 'BATCH-SUMMARY.0.JSON' probe would read as case-insensitive if a distinct
+    # all-caps file happened to exist beside the batch-summary files on a case-sensitive
     # volume. A guid name can't pre-exist, and the letter prefix guarantees its upper-
     # and lower-cased forms differ. If the probe can't be written, FAIL CLOSED rather
     # than guess from the OS: macOS can run a case-sensitive volume, so an OS guess of
@@ -145,7 +156,7 @@ if (Test-Path -LiteralPath $batchSummary) {
 
     # Re-validate every id against batch-review.ps1's slug rule before joining it into
     # a path. batch-review.ps1 validates ids it writes, but the skill's repair flow
-    # tells operators to REBUILD batch-summary.json by hand, so this file is not a
+    # tells operators to REBUILD the summary files by hand, so the files are not a
     # trusted source: a hand-written or corrupted id like '..\other' joins straight
     # into <RunRoot>\..\other\metrics.json, escaping RunRoot to aggregate an unrelated
     # file — and the orphan scan below misses it, because the resolved dir is not a
@@ -156,7 +167,7 @@ if (Test-Path -LiteralPath $batchSummary) {
         $parts = @()
         if ($rowsMissingId -gt 0) { $parts += "$rowsMissingId row(s) with no chunkId" }
         if ($badIds)             { $parts += "invalid chunk id(s): $($badIds -join ', ')" }
-        Write-Error "batch-summary.json is malformed ($($parts -join '; ')). Every row must carry a chunkId matching [A-Za-z0-9._-] and not all dots (it names a direct child of RunRoot). Refusing to aggregate — rebuild the summary with valid ids." -ErrorAction Continue
+        Write-Error "batch-summary files are malformed ($($parts -join '; ')). Every row must carry a chunkId matching [A-Za-z0-9._-] and not all dots (it names a direct child of RunRoot). Refusing to aggregate — rebuild the summary with valid ids." -ErrorAction Continue
         exit 5
     }
 
@@ -183,14 +194,14 @@ if (Test-Path -LiteralPath $batchSummary) {
     })
     if ($contradictions) {
         $names = ($contradictions | ForEach-Object { $_.chunkId }) -join ', '
-        Write-Error "batch-summary.json marks these chunk(s) as failed (exitCode != 0 or hasMetrics = false) yet a metrics.json exists in their dir: $names. Counting it would inflate the totals; the summary and the filesystem disagree. Refusing to aggregate — remove the stale metrics.json or correct the row before re-running." -ErrorAction Continue
+        Write-Error "batch-summary files mark these chunk(s) as failed (exitCode != 0 or hasMetrics = false) yet a metrics.json exists in their dir: $names. Counting it would inflate the totals; the summary and the filesystem disagree. Refusing to aggregate — remove the stale metrics.json or correct the row before re-running." -ErrorAction Continue
         exit 7
     }
 
     # A metrics.json under RunRoot the summary does NOT name means the summary is not
-    # describing this run — it was overwritten by a partial re-run (batch-review.ps1
-    # now unions, but run roots predating that fix still exist), or a chunk dir was
-    # hand-made or backed up inside the RunRoot. Emitting anyway is the failure this
+    # describing this run — it was truncated by a partial re-run before the per-invocation
+    # file approach, or a chunk dir was hand-made or backed up inside the RunRoot.
+    # Emitting anyway is the failure this
     # guard exists to stop: totals come out short and every `accepted` is clamped down
     # to match, so a broken run reads as a smaller but plausible one. The clamp
     # warnings below do fire, but they describe the consequence, not the cause.
@@ -206,12 +217,12 @@ if (Test-Path -LiteralPath $batchSummary) {
     if ($orphans) {
         $orphanDirs = ($orphans | ForEach-Object { '  ' + (Split-Path -Parent $_.FullName) }) -join [Environment]::NewLine
         Write-Error @"
-batch-summary.json names $chunkCount chunk(s), but $($orphans.Count) further metrics.json exist under this RunRoot that it does not name:
+batch-summary files name $chunkCount chunk(s), but $($orphans.Count) further metrics.json exist under this RunRoot that they do not name:
 $orphanDirs
 The summary is not describing this run, so ChunkCount and every per-vendor total would be short and every accepted count silently clamped to match. Refusing to emit. Fix by ONE of:
-  - re-run batch-review.ps1 for the missing chunks into this RunRoot (it unions the summary); or
-  - rebuild batch-summary.json from the chunk dirs; or
-  - delete batch-summary.json to aggregate every chunk dir under RunRoot instead
+  - re-run batch-review.ps1 for the missing chunks into this RunRoot (it writes a new batch-summary.*.json); or
+  - rebuild the batch-summary files from the chunk dirs; or
+  - delete all batch-summary.*.json to aggregate every chunk dir under RunRoot instead
     (WARNING: the scan finds only chunks that left a metrics.json, so any FAILED
     chunk is silently dropped -- only do this when every chunk succeeded).
 "@ -ErrorAction Continue
